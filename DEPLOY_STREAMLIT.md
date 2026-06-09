@@ -36,17 +36,26 @@ En unos minutos tendrás una URL pública tipo:
 
 `https://lector-actas-xxxxx.streamlit.app`
 
-### 3. API key en producción
+### 3. Secrets de seguridad (recomendado en producción)
 
-**Para varios usuarios (recomendado):** no configures secrets en el servidor. Cada persona pega su key en la barra lateral al entrar.
-
-**Solo tú usarás la app:** en Streamlit Cloud → **Settings → Secrets** puedes pegar:
+En Streamlit Cloud → **Settings → Secrets**, pega (adaptado desde `.streamlit/secrets.toml.example`):
 
 ```toml
-GEMINI_API_KEY = "tu_clave_aqui"
+# Genera con: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+SESSION_ENCRYPTION_KEY = "tu_clave_fernet_generada"
+
+SESSION_TIMEOUT_MINUTES = 30
+
+# Solo quien conozca esta contraseña puede abrir la app
+APP_PASSWORD = "contraseña_interna_del_equipo"
+
+# NO actives la key compartida del servidor para equipos
+ALLOW_SERVER_GEMINI_KEY = false
 ```
 
-Eso usa la clave del servidor para todos los visitantes. Úsalo solo en despliegues privados o de prueba.
+**Cada usuario** sigue pegando **su propia API key de Gemini** en la barra lateral. La contraseña `APP_PASSWORD` solo evita que cualquier persona de internet entre a la app.
+
+**Modo admin (solo tú):** si eres el único usuario, puedes poner `ALLOW_SERVER_GEMINI_KEY = true` y `GEMINI_API_KEY = "..."` para no pedir key en la sidebar.
 
 ### 4. Actualizar la app
 
@@ -75,27 +84,29 @@ export GEMINI_API_KEY="..."   # solo si quieres key centralizada
 
 ## Seguridad de la API key — comparativa
 
-| | Escritorio (.exe) | Web (sidebar) | Web (secrets del servidor) |
+| | Escritorio (.exe) | Web (mejorada) | Web (key en secrets) |
 |---|---|---|---|
-| **Dónde vive la key** | Credential Manager de Windows (cifrado SO) | RAM de la sesión Streamlit | Secrets de Streamlit Cloud |
-| **Persistencia** | Sí, hasta que la borres | No (se pierde al cerrar sesión) | Sí, en el servidor |
-| **Quién la ve** | Solo tu usuario Windows | Tú + proceso del servidor durante la sesión | Admin del deploy + todos los usuarios comparten cuota |
-| **Ideal para** | Uso diario en PC | Equipo remoto, cada uno con su key | Pruebas / un solo operador |
-| **Nivel de seguridad** | Alto | Medio-alto (aceptable para uso interno) | Medio (no compartir en producción con muchos usuarios) |
+| **Dónde vive la key** | Credential Manager (Windows) | Sesión cifrada con Fernet | Secrets de Streamlit |
+| **Persistencia** | Sí, hasta borrarla | Expira por inactividad (~30 min) | Permanente en servidor |
+| **Acceso a la app** | Solo tu PC | HTTPS + `APP_PASSWORD` opcional | Igual |
+| **Nivel** | **Alto** | **Medio-alto** (uso interno) | Medio (no para equipos) |
 
-### Qué hace la app para protegerte (web)
+### Capas de seguridad en la web (implementadas)
 
-- Campo tipo **password** (no se muestra en pantalla).
-- La key **no se guarda en disco** ni en cookies del navegador.
-- Se pasa **directamente** a Gemini en cada petición, sin escribirla en `os.environ`.
-- Botón **“Borrar clave de la sesión”** en la barra lateral.
+1. **HTTPS** — Streamlit Cloud cifra el tráfico.
+2. **APP_PASSWORD** — muro de acceso; la URL pública no basta para usar la app.
+3. **Cifrado Fernet** — la key del usuario no se guarda en texto plano en `session_state`.
+4. **Formulario con clear_on_submit** — la key no queda visible en el campo tras guardar.
+5. **Expiración por inactividad** — la key se borra sola tras X minutos.
+6. **Key personal por usuario** — cada uno usa su cuota de Gemini.
+7. **ALLOW_SERVER_GEMINI_KEY = false** por defecto — evita key compartida accidental.
 
-### Buenas prácticas
+### Buenas prácticas adicionales
 
 1. **Una API key por persona** en equipos de 3–4 usuarios.
-2. **Restringe la API key en Google AI Studio** (límites por aplicación/referrer si Google lo permite en tu cuenta).
-3. **Revoca** keys que hayan filtrado en [Google AI Studio](https://aistudio.google.com/apikey).
-4. Para datos muy sensibles, prioriza la **app de escritorio** o un backend propio que no exponga la key al cliente.
+2. **Restringe y rota keys** en [Google AI Studio](https://aistudio.google.com/apikey).
+3. **No compartas** `APP_PASSWORD` ni `SESSION_ENCRYPTION_KEY` por chat/correo.
+4. **Máxima seguridad:** app de escritorio, o un **backend propio** donde la key nunca llega al navegador (requiere desarrollo extra).
 
 ---
 
@@ -104,5 +115,5 @@ export GEMINI_API_KEY="..."   # solo si quieres key centralizada
 - [ ] `.env` no está en Git
 - [ ] `requirements.txt` incluye todas las dependencias
 - [ ] Probaste `streamlit run app.py` en local
-- [ ] Decidiste si cada usuario lleva su key o usas secrets centralizados
-- [ ] (Opcional) App privada en Streamlit Cloud con autenticación de equipo
+- [ ] Configuraste `SESSION_ENCRYPTION_KEY` y `APP_PASSWORD` en Streamlit Secrets
+- [ ] `ALLOW_SERVER_GEMINI_KEY` está en `false` si hay varios usuarios

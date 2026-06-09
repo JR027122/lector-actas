@@ -12,6 +12,14 @@ from src.core.document_processor import process_document
 from src.core.processing_modes import MODE_OPTIONS, OCR_AND_RENAME, exporta_excel, renombra_archivo
 from src.utils.excel_export import limpiar_registro, ordenar_dataframe
 from src.utils.file_renamer import construir_nuevo_nombre
+from src.utils.web_session_security import (
+    clear_user_api_key,
+    has_user_api_key,
+    logout_app,
+    require_app_login,
+    resolve_web_api_key,
+    save_user_api_key,
+)
 
 st.set_page_config(
     page_title="Lector de Actas | OCR Inteligente",
@@ -63,70 +71,73 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+require_app_login()
+
 
 def _configurar_api_key():
-    """Gestiona la API key solo en memoria de sesión (web). No escribe en disco."""
-    if "gemini_api_key" not in st.session_state:
-        st.session_state.gemini_api_key = ""
-
+    """API key cifrada en sesión + formulario que no persiste el valor en el widget."""
     st.sidebar.markdown("### Configuración")
 
-    clave_input = st.sidebar.text_input(
-        "API key de Gemini",
-        type="password",
-        placeholder="Pega tu clave de Google AI Studio",
-        help="Se usa solo durante tu sesión. No se guarda en el navegador ni en el servidor.",
-        key="api_key_input",
-    )
-    if clave_input.strip():
-        st.session_state.gemini_api_key = clave_input.strip()
-
-    if st.session_state.gemini_api_key:
-        st.sidebar.success("Clave activa en esta sesión.")
+    if has_user_api_key():
+        st.sidebar.success("Clave activa (cifrada en sesión).")
+        try:
+            minutos = int(st.secrets.get("SESSION_TIMEOUT_MINUTES", 30))
+        except Exception:
+            minutos = 30
+        st.sidebar.caption(f"Se borra automáticamente tras {minutos} min sin actividad.")
         if st.sidebar.button("Borrar clave de la sesión", use_container_width=True):
-            st.session_state.gemini_api_key = ""
-            if "api_key_input" in st.session_state:
-                del st.session_state["api_key_input"]
+            clear_user_api_key()
             st.rerun()
-        return st.session_state.gemini_api_key
+        return resolve_web_api_key()
 
-    # Fallback opcional: clave del servidor (despliegue privado con secrets.toml)
-    try:
-        clave_servidor = st.secrets.get("GEMINI_API_KEY", "").strip()
-        if clave_servidor:
-            st.sidebar.warning(
-                "Usando la API key configurada en el servidor. "
-                "Todos los visitantes comparten la misma cuota."
-            )
-            return clave_servidor
-    except Exception:
-        pass
+    with st.sidebar.form("api_key_form", clear_on_submit=True):
+        clave_input = st.text_input(
+            "API key de Gemini",
+            type="password",
+            placeholder="Pega tu clave de Google AI Studio",
+            help="Se cifra en la sesión del servidor. No queda en el navegador.",
+        )
+        if st.form_submit_button("Guardar clave en sesión", use_container_width=True):
+            if clave_input.strip():
+                save_user_api_key(clave_input.strip())
+                st.rerun()
+            else:
+                st.warning("Introduce una clave válida.")
 
-    st.sidebar.warning("Introduce tu API key para continuar.")
+    clave_servidor = resolve_web_api_key()
+    if clave_servidor and not has_user_api_key():
+        st.sidebar.warning("Usando API key del servidor (modo admin).")
+        return clave_servidor
+
+    st.sidebar.warning("Guarda tu API key para continuar.")
     return None
 
 
 def _panel_seguridad():
     with st.sidebar.expander("Seguridad de tu API key"):
         st.markdown("""
-**Escritorio (.exe)** — Más seguro para un solo usuario  
-La clave se guarda cifrada en el **Administrador de credenciales de Windows** (`keyring`). Solo tu usuario de Windows puede leerla.
+**Capas activas en la web**
+- **HTTPS** en Streamlit Cloud.
+- **Cifrado Fernet** de la key en la sesión (no texto plano en memoria de Streamlit).
+- **Formulario** que no deja la key pegada en el campo tras guardar.
+- **Expiración automática** por inactividad.
+- **Contraseña de equipo** opcional (`APP_PASSWORD` en secrets).
 
-**Web (esta página)** — Seguro para uso en equipo con matices  
-- La clave viaja por **HTTPS** hasta el servidor de la app.  
-- Vive **solo en memoria** durante tu sesión; no se escribe en disco ni en cookies.  
-- Cada persona debe usar **su propia key** (cuota propia de Gemini).  
-- Al cerrar la pestaña o borrar la sesión, la clave desaparece.
+**Escritorio (.exe)** — Máxima seguridad  
+Key en el **Administrador de credenciales de Windows** (`keyring`).
 
-**Riesgos a tener en cuenta**  
-- Quien administre el servidor donde corre la app *podría* interceptar tráfico o memoria (igual que cualquier SaaS).  
-- No pegues la key en chats, capturas ni correos.  
-- Si revocas la key en Google AI Studio, deja de funcionar al instante.
+**Buenas prácticas en Google AI Studio**
+1. Crea **una key por persona**.
+2. En [Google AI Studio](https://aistudio.google.com/apikey), **restringe la key** (límite de uso / revocación rápida).
+3. **Revoca** de inmediato cualquier key que hayas compartido por error.
 
-**Recomendación**  
-Uso diario en oficina → **app de escritorio**.  
-Acceso remoto ocasional → **web con key personal** por usuario.
+**Límite inherente de apps web**  
+La key debe llegar al servidor para llamar a Gemini. Un atacante con control del servidor podría interceptarla; por eso conviene **APP_PASSWORD** + keys personales + uso interno.
         """)
+
+    if st.sidebar.button("Cerrar sesión de la app", use_container_width=True):
+        logout_app()
+        st.rerun()
 
 
 def _guardar_temporal(uploaded_file) -> str:

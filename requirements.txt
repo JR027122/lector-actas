@@ -9,3 +9,4 @@ pdf2image
 pyinstaller
 PyQt6
 keyring
+cryptography
