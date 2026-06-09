@@ -1,0 +1,28 @@
+# Entornos virtuales
+venv/
+.venv/
+env/
+.env
+
+# PyInstaller / builds
+build/
+dist/
+*.spec.bak
+
+# Archivos compilados de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Base de datos local
+src/db/*.db
+src/db/*.sqlite3
+
+# Archivos de Streamlit y descargas
+.streamlit/secrets.toml
+*.xlsx
+*.csv
+
+# Carpetas del sistema
+.DS_Store
+Thumbs.db
