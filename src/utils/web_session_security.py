@@ -97,12 +97,12 @@ def get_user_api_key() -> str | None:
 def get_server_api_key() -> str | None:
     """
     Key centralizada del servidor (secrets). Desactivada por defecto en producción
-    salvo que ALLOW_SERVER_GEMINI_KEY = true en secrets.
+    salvo que ALLOW_SERVER_OPENROUTER_KEY = true en secrets.
     """
     try:
-        if not st.secrets.get("ALLOW_SERVER_GEMINI_KEY", False):
+        if not st.secrets.get("ALLOW_SERVER_OPENROUTER_KEY", False):
             return None
-        key = st.secrets.get("GEMINI_API_KEY", "").strip()
+        key = st.secrets.get("OPENROUTER_API_KEY", "").strip()
         return key or None
     except Exception:
         return None

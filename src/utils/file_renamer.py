@@ -153,7 +153,7 @@ def renombrar_archivo(file_path, data):
 
     nuevo_nombre = construir_nuevo_nombre(niu, fecha, extension)
     if not nuevo_nombre:
-        print(f"⚠️ No se renombró '{nombre_actual}': falta NIU o Fecha en los datos extraídos.")
+        print(f"No se renombró '{nombre_actual}': falta NIU o Fecha en los datos extraídos.")
         return file_path
 
     # Si ya tiene el nombre correcto, no hacer nada
@@ -177,8 +177,8 @@ def renombrar_archivo(file_path, data):
 
     try:
         os.rename(file_path, nueva_ruta)
-        print(f"📝 Renombrado: '{nombre_actual}' -> '{nuevo_nombre}'")
+        print(f"Renombrado: '{nombre_actual}' -> '{nuevo_nombre}'")
         return nueva_ruta
     except OSError as e:
-        print(f"❌ No se pudo renombrar '{nombre_actual}': {e}")
+        print(f"No se pudo renombrar '{nombre_actual}': {e}")
         return file_path

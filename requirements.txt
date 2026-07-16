@@ -3,10 +3,12 @@ pandas
 Pillow
 sqlalchemy
 openpyxl
-google-genai
+openai
+json-repair
 python-dotenv
 pdf2image
 pyinstaller
 PyQt6
 keyring
 cryptography
+PyMuPDF

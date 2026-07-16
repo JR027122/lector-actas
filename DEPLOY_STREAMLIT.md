@@ -50,12 +50,12 @@ SESSION_TIMEOUT_MINUTES = 30
 APP_PASSWORD = "contraseña_interna_del_equipo"
 
 # NO actives la key compartida del servidor para equipos
-ALLOW_SERVER_GEMINI_KEY = false
+ALLOW_SERVER_OPENROUTER_KEY = false
 ```
 
-**Cada usuario** sigue pegando **su propia API key de Gemini** en la barra lateral. La contraseña `APP_PASSWORD` solo evita que cualquier persona de internet entre a la app.
+**Cada usuario** sigue pegando **su propia API key de OpenRouter** en la barra lateral. La contraseña `APP_PASSWORD` solo evita que cualquier persona de internet entre a la app.
 
-**Modo admin (solo tú):** si eres el único usuario, puedes poner `ALLOW_SERVER_GEMINI_KEY = true` y `GEMINI_API_KEY = "..."` para no pedir key en la sidebar.
+**Modo admin (solo tú):** si eres el único usuario, puedes poner `ALLOW_SERVER_OPENROUTER_KEY = true` y `OPENROUTER_API_KEY = "..."` para no pedir key en la sidebar.
 
 ### 4. Actualizar la app
 
@@ -77,7 +77,7 @@ Detrás de **nginx** o **Azure Application Gateway** con HTTPS. No expongas el p
 Variables de entorno opcionales:
 
 ```bash
-export GEMINI_API_KEY="..."   # solo si quieres key centralizada
+export OPENROUTER_API_KEY="..."   # solo si quieres key centralizada
 ```
 
 ---
@@ -98,13 +98,13 @@ export GEMINI_API_KEY="..."   # solo si quieres key centralizada
 3. **Cifrado Fernet** — la key del usuario no se guarda en texto plano en `session_state`.
 4. **Formulario con clear_on_submit** — la key no queda visible en el campo tras guardar.
 5. **Expiración por inactividad** — la key se borra sola tras X minutos.
-6. **Key personal por usuario** — cada uno usa su cuota de Gemini.
-7. **ALLOW_SERVER_GEMINI_KEY = false** por defecto — evita key compartida accidental.
+6. **Key personal por usuario** — cada uno usa su propio crédito de OpenRouter.
+7. **ALLOW_SERVER_OPENROUTER_KEY = false** por defecto — evita key compartida accidental.
 
 ### Buenas prácticas adicionales
 
 1. **Una API key por persona** en equipos de 3–4 usuarios.
-2. **Restringe y rota keys** en [Google AI Studio](https://aistudio.google.com/apikey).
+2. **Restringe y rota keys** en [OpenRouter](https://openrouter.ai/keys) (límite de gasto por key).
 3. **No compartas** `APP_PASSWORD` ni `SESSION_ENCRYPTION_KEY` por chat/correo.
 4. **Máxima seguridad:** app de escritorio, o un **backend propio** donde la key nunca llega al navegador (requiere desarrollo extra).
 
@@ -116,4 +116,4 @@ export GEMINI_API_KEY="..."   # solo si quieres key centralizada
 - [ ] `requirements.txt` incluye todas las dependencias
 - [ ] Probaste `streamlit run app.py` en local
 - [ ] Configuraste `SESSION_ENCRYPTION_KEY` y `APP_PASSWORD` en Streamlit Secrets
-- [ ] `ALLOW_SERVER_GEMINI_KEY` está en `false` si hay varios usuarios
+- [ ] `ALLOW_SERVER_OPENROUTER_KEY` está en `false` si hay varios usuarios

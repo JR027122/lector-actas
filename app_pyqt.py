@@ -1,20 +1,24 @@
 import sys
 import os
+import threading
 import time
 import pandas as pd
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QProgressBar,
     QDialog, QLineEdit, QDialogButtonBox, QMessageBox,
-    QFrame, QButtonGroup, QRadioButton, QSizePolicy,
+    QFrame, QButtonGroup, QRadioButton, QSizePolicy, QComboBox,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl
+from PyQt6.QtGui import QFont, QDesktopServices
 
 from src.core.document_processor import process_document, process_folder
+from src.core.openrouter_processor import MODELO_POR_DEFECTO, MODELOS_DISPONIBLES
 from src.core.processing_modes import MODE_OPTIONS, OCR_AND_RENAME, exporta_excel, renombra_archivo
 from src.utils.excel_export import limpiar_registro, ordenar_dataframe
+from src.utils.niu_lookup import cargar_base_usuarios
 from src.utils.secure_api_key import resolve_api_key, save_api_key
+from src.utils.progress_tracker import ProgressTracker
 
 # ── Estilos ──────────────────────────────────────────────────────────────────
 STYLESHEET = """
@@ -79,19 +83,69 @@ QLabel#statusOk { color: #059669; font-weight: 600; }
 QLabel#statusErr { color: #dc2626; font-weight: 600; }
 QLabel#statusInfo { color: #2563eb; }
 QLabel#pathLabel { color: #64748b; font-size: 12px; }
+QLabel#apiKeyLink { font-size: 12px; }
+QLabel#apiKeyLink a { color: #2563eb; text-decoration: none; }
+QLabel#apiKeyLink a:hover { text-decoration: underline; }
 """
+
+OPENROUTER_API_KEY_URL = "https://openrouter.ai/keys"
+
+# Cómo describir en la UI de dónde vino el NIU recuperado
+_NIU_ORIGEN_TXT = {
+    "cedula": "cédula (base de usuarios)",
+    "nombre": "nombre (base de usuarios)",
+    "nombre_archivo": "nombre del archivo original",
+}
+
+
+def abrir_pagina_api_key():
+    QDesktopServices.openUrl(QUrl(OPENROUTER_API_KEY_URL))
+
+
+def _crear_enlace_api_key() -> QLabel:
+    enlace = QLabel(
+        f'<a href="{OPENROUTER_API_KEY_URL}">Obtener API key en OpenRouter</a>'
+    )
+    enlace.setObjectName("apiKeyLink")
+    enlace.setOpenExternalLinks(True)
+    enlace.setTextFormat(Qt.TextFormat.RichText)
+    enlace.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+    return enlace
+
+
+def preguntar_reanudacion(parent=None, carpeta="") -> bool:
+    """Pregunta al usuario si desea reanudar un procesamiento anterior.
+
+    Retorna True si quiere continuar, False si quiere empezar de nuevo.
+    """
+    dlg = QMessageBox(parent)
+    dlg.setWindowTitle("Procesamiento anterior detectado")
+    dlg.setText(
+        f"Se detectó un procesamiento anterior en:\n\n{carpeta}\n\n"
+        "¿Deseas continuar desde donde se quedó o empezar de nuevo?"
+    )
+    dlg.setIcon(QMessageBox.Icon.Question)
+    btn_continuar = dlg.addButton("Continuar", QMessageBox.ButtonRole.AcceptRole)
+    btn_nuevo = dlg.addButton("Empezar de nuevo", QMessageBox.ButtonRole.RejectRole)
+    dlg.setDefaultButton(btn_continuar)
+    dlg.exec()
+    return dlg.clickedButton() == btn_continuar
 
 
 def solicitar_y_guardar_api_key(parent=None):
     dlg = QDialog(parent)
-    dlg.setWindowTitle("API key de Google Gemini")
+    dlg.setWindowTitle("API key de OpenRouter")
     dlg.setMinimumWidth(480)
     layout = QVBoxLayout(dlg)
     layout.addWidget(QLabel(
-        "Introduce tu API key de Google AI Studio.\n"
-        "Se guardará de forma segura en el Administrador de credenciales de Windows.\n"
-        "Clave gratuita: https://aistudio.google.com/apikey"
+        "Introduce tu API key de OpenRouter.\n"
+        "Se guardará de forma segura en el Administrador de credenciales de Windows."
     ))
+    layout.addWidget(_crear_enlace_api_key())
+    btn_obtener = QPushButton("Abrir OpenRouter")
+    btn_obtener.setObjectName("secondaryBtn")
+    btn_obtener.clicked.connect(abrir_pagina_api_key)
+    layout.addWidget(btn_obtener)
     edit = QLineEdit()
     edit.setEchoMode(QLineEdit.EchoMode.Password)
     edit.setPlaceholderText("Pega aquí tu API key")
@@ -109,7 +163,7 @@ def solicitar_y_guardar_api_key(parent=None):
         QMessageBox.warning(parent, "API key", "Debes introducir una clave no vacía.")
         return False
     save_api_key(clave)
-    os.environ["GEMINI_API_KEY"] = clave
+    os.environ["OPENROUTER_API_KEY"] = clave
     return True
 
 
@@ -123,11 +177,31 @@ class WorkerThread(QThread):
     progress_update = pyqtSignal(int, int, str)
     finished_success = pyqtSignal(list)
     finished_error = pyqtSignal(str)
+    cuota_agotada = pyqtSignal()
 
-    def __init__(self, folder_path, mode):
+    def __init__(self, folder_path, mode, user_db=None, modelo=None, progress_tracker=None, excel_callback=None):
         super().__init__()
         self.folder_path = folder_path
         self.mode = mode
+        self.user_db = user_db
+        self.modelo = modelo
+        self.progress_tracker = progress_tracker
+        self.excel_callback = excel_callback
+        self._evento_respuesta = threading.Event()
+        self._nueva_api_key = None
+
+    def responder_cuota(self, nueva_api_key):
+        """Llamado desde la UI con la nueva key (o None para detener)."""
+        self._nueva_api_key = nueva_api_key
+        self._evento_respuesta.set()
+
+    def _quota_callback(self):
+        """Pausa el hilo hasta que el usuario decida en la UI."""
+        self._nueva_api_key = None
+        self._evento_respuesta.clear()
+        self.cuota_agotada.emit()
+        self._evento_respuesta.wait()
+        return self._nueva_api_key
 
     def run(self):
         try:
@@ -135,7 +209,10 @@ class WorkerThread(QThread):
                 self.progress_update.emit(actual, total, filename)
 
             resultados = process_folder(
-                self.folder_path, mode=self.mode, progress_callback=callback
+                self.folder_path, mode=self.mode, progress_callback=callback,
+                user_db=self.user_db, quota_callback=self._quota_callback,
+                modelo=self.modelo, progress_tracker=self.progress_tracker,
+                excel_callback=self.excel_callback,
             )
             self.finished_success.emit(resultados)
         except Exception as e:
@@ -145,18 +222,27 @@ class WorkerThread(QThread):
 class WorkerIndividual(QThread):
     finished_success = pyqtSignal(dict)
     finished_error = pyqtSignal(str)
+    cuota_agotada = pyqtSignal()
 
-    def __init__(self, file_path, mode):
+    def __init__(self, file_path, mode, user_db=None, modelo=None):
         super().__init__()
         self.file_path = file_path
         self.filename = os.path.basename(file_path)
         self.mode = mode
+        self.user_db = user_db
+        self.modelo = modelo
 
     def run(self):
         try:
-            data = process_document(self.file_path, self.filename, self.mode)
+            data = process_document(
+                self.file_path, self.filename, self.mode,
+                user_db=self.user_db, modelo=self.modelo,
+            )
             if "Error" in data:
-                self.finished_error.emit(data["Error"])
+                if data.get("__sin_creditos__"):
+                    self.cuota_agotada.emit()
+                else:
+                    self.finished_error.emit(data["Error"])
             else:
                 nueva_ruta = data.get("__ruta_actualizada__")
                 if nueva_ruta:
@@ -171,6 +257,10 @@ class AppOCR(QMainWindow):
         super().__init__()
         self.ruta_actual = ""
         self.tipo_procesamiento = ""
+        self.user_db = None
+        self.ruta_base_usuarios = ""
+        self.progress_tracker = None
+        self.excel_path = ""
         self._build_ui()
 
     def _card(self, title: str) -> tuple[QFrame, QVBoxLayout]:
@@ -186,7 +276,7 @@ class AppOCR(QMainWindow):
 
     def _build_ui(self):
         self.setWindowTitle("Lector de Actas — OCR Inteligente")
-        self.resize(820, 580)
+        self.resize(820, 640)
         self.setStyleSheet(STYLESHEET)
 
         central = QWidget()
@@ -204,7 +294,7 @@ class AppOCR(QMainWindow):
         hl.setContentsMargins(24, 16, 24, 16)
         t = QLabel("Lector de Actas")
         t.setObjectName("headerTitle")
-        s = QLabel("Digitalización inteligente de actas de mantenimiento con Google Gemini")
+        s = QLabel("Digitalización inteligente de actas de mantenimiento con IA (OpenRouter)")
         s.setObjectName("headerSub")
         hl.addWidget(t)
         hl.addWidget(s)
@@ -227,6 +317,28 @@ class AppOCR(QMainWindow):
             desc.setWordWrap(True)
             desc.setStyleSheet("color: #64748b; font-size: 11px; margin-left: 24px; margin-bottom: 8px;")
             mode_layout.addWidget(desc)
+
+        mode_layout.addSpacing(8)
+        lbl_modelo = QLabel("Modelo de IA")
+        lbl_modelo.setStyleSheet("color: #0f172a; font-size: 13px; font-weight: 600;")
+        mode_layout.addWidget(lbl_modelo)
+        self.combo_modelo = QComboBox()
+        indice_defecto = 0
+        for i, (slug, etiqueta) in enumerate(MODELOS_DISPONIBLES.items()):
+            self.combo_modelo.addItem(etiqueta, userData=slug)
+            if slug == MODELO_POR_DEFECTO:
+                indice_defecto = i
+        self.combo_modelo.setCurrentIndex(indice_defecto)
+        mode_layout.addWidget(self.combo_modelo)
+        desc_modelo = QLabel(
+            "Flash es más preciso; Flash Lite es más económico pero puede cometer "
+            "más errores (se corrigen automáticamente cuando es posible; ver "
+            "Revisar_Manual)."
+        )
+        desc_modelo.setWordWrap(True)
+        desc_modelo.setStyleSheet("color: #64748b; font-size: 11px;")
+        mode_layout.addWidget(desc_modelo)
+
         body.addWidget(mode_card, stretch=1)
 
         # Acciones
@@ -240,17 +352,41 @@ class AppOCR(QMainWindow):
         self.btn_archivo.clicked.connect(self.seleccionar_archivo)
         self.btn_api = QPushButton("API key")
         self.btn_api.setObjectName("secondaryBtn")
-        self.btn_api.setToolTip("Configurar clave de Gemini")
+        self.btn_api.setToolTip("Configurar clave de OpenRouter o usar el enlace de abajo para obtener una")
         self.btn_api.clicked.connect(self.configurar_api_key)
         btn_row.addWidget(self.btn_carpeta)
         btn_row.addWidget(self.btn_archivo)
         btn_row.addWidget(self.btn_api)
         action_layout.addLayout(btn_row)
+        action_layout.addWidget(_crear_enlace_api_key())
 
         self.lbl_ruta = QLabel("Ningún archivo o carpeta seleccionado")
         self.lbl_ruta.setObjectName("pathLabel")
         self.lbl_ruta.setWordWrap(True)
         action_layout.addWidget(self.lbl_ruta)
+
+        # Base de usuarios opcional (NIU por cédula o nombre)
+        db_row = QHBoxLayout()
+        self.btn_base_usuarios = QPushButton("Base de usuarios (opcional)")
+        self.btn_base_usuarios.setObjectName("secondaryBtn")
+        self.btn_base_usuarios.setToolTip(
+            "Excel/CSV con columnas NIU, Cédula y/o Nombre.\n"
+            "Si un acta no tiene NIU visible, se busca por cédula, nombre o el "
+            "nombre del archivo original, validando siempre contra esta base."
+        )
+        self.btn_base_usuarios.clicked.connect(self.seleccionar_base_usuarios)
+        self.btn_quitar_base = QPushButton("Quitar")
+        self.btn_quitar_base.setObjectName("secondaryBtn")
+        self.btn_quitar_base.setEnabled(False)
+        self.btn_quitar_base.clicked.connect(self.quitar_base_usuarios)
+        db_row.addWidget(self.btn_base_usuarios)
+        db_row.addWidget(self.btn_quitar_base)
+        action_layout.addLayout(db_row)
+
+        self.lbl_base = QLabel("Sin base de usuarios cargada")
+        self.lbl_base.setObjectName("pathLabel")
+        self.lbl_base.setWordWrap(True)
+        action_layout.addWidget(self.lbl_base)
 
         self.btn_procesar = QPushButton("Iniciar procesamiento")
         self.btn_procesar.setObjectName("primaryBtn")
@@ -258,7 +394,7 @@ class AppOCR(QMainWindow):
         self.btn_procesar.setMinimumHeight(48)
         self.btn_procesar.clicked.connect(self.iniciar_procesamiento)
         action_layout.addWidget(self.btn_procesar)
-        body.addWidget(action_card, stretch=1.2)
+        body.addWidget(action_card, stretch=2)
 
         root.addLayout(body)
 
@@ -278,20 +414,70 @@ class AppOCR(QMainWindow):
         idx = self.mode_group.checkedId()
         return list(MODE_OPTIONS.keys())[idx]
 
+    def _modelo_actual(self) -> str:
+        return self.combo_modelo.currentData() or MODELO_POR_DEFECTO
+
     def _set_busy(self, busy: bool):
         self.btn_carpeta.setEnabled(not busy)
         self.btn_archivo.setEnabled(not busy)
         self.btn_procesar.setEnabled(not busy)
+        self.combo_modelo.setEnabled(not busy)
         for btn in self.mode_group.buttons():
             btn.setEnabled(not busy)
+
+    def _actualizar_excel_incremental(self, registros_limpios, carpeta):
+        """Actualiza el Excel resultado_consolidado.xlsx de forma incremental.
+
+        Carga datos anteriores si existen y los combina con los nuevos.
+        """
+        try:
+            ruta_excel = os.path.join(carpeta, "resultado_consolidado.xlsx")
+
+            # Cargar datos anteriores si el archivo existe
+            datos_anteriores = []
+            if os.path.exists(ruta_excel):
+                try:
+                    df_anterior = pd.read_excel(ruta_excel)
+                    datos_anteriores = df_anterior.to_dict("records")
+                except Exception:
+                    pass
+
+            # Combinar datos anteriores con nuevos (evitando duplicados por nombre de archivo)
+            archivos_nuevos = {r.get("Archivo") for r in registros_limpios}
+            datos_anteriores_filtrados = [
+                r for r in datos_anteriores
+                if r.get("Archivo") not in archivos_nuevos
+            ]
+
+            # Escribir combinados
+            todos_datos = datos_anteriores_filtrados + registros_limpios
+            df = ordenar_dataframe(pd.DataFrame(todos_datos))
+            df.to_excel(ruta_excel, index=False, engine="openpyxl")
+        except Exception as e:
+            print(f"Error al actualizar Excel incrementalmente: {e}")
 
     def seleccionar_carpeta(self):
         carpeta = QFileDialog.getExistingDirectory(self, "Selecciona la carpeta con las actas")
         if carpeta:
             self.tipo_procesamiento = "carpeta"
             self.ruta_actual = carpeta
-            self.lbl_ruta.setText(f"Carpeta: {carpeta}")
-            self.lbl_ruta.setStyleSheet("color: #0f172a; font-size: 12px;")
+            self.progress_tracker = ProgressTracker(carpeta)
+            self.excel_path = os.path.join(carpeta, "resultado_consolidado.xlsx")
+
+            # Detectar si hay un procesamiento anterior incompleto
+            if self.progress_tracker.has_previous_progress():
+                if preguntar_reanudacion(self, carpeta):
+                    self.lbl_ruta.setText(f"Carpeta: {carpeta} (reanudando...)")
+                    self.lbl_ruta.setStyleSheet("color: #059669; font-size: 12px;")
+                else:
+                    # Usuario quiere empezar de nuevo: limpiar checkpoint
+                    self.progress_tracker.delete()
+                    self.lbl_ruta.setText(f"Carpeta: {carpeta}")
+                    self.lbl_ruta.setStyleSheet("color: #0f172a; font-size: 12px;")
+            else:
+                self.lbl_ruta.setText(f"Carpeta: {carpeta}")
+                self.lbl_ruta.setStyleSheet("color: #0f172a; font-size: 12px;")
+
             self.btn_procesar.setEnabled(True)
 
     def seleccionar_archivo(self):
@@ -306,6 +492,34 @@ class AppOCR(QMainWindow):
             self.lbl_ruta.setStyleSheet("color: #0f172a; font-size: 12px;")
             self.btn_procesar.setEnabled(True)
 
+    def seleccionar_base_usuarios(self):
+        archivo, _ = QFileDialog.getOpenFileName(
+            self, "Selecciona la base de usuarios", "",
+            "Excel y CSV (*.xlsx *.xls *.csv)"
+        )
+        if not archivo:
+            return
+        try:
+            self.user_db = cargar_base_usuarios(archivo)
+            self.ruta_base_usuarios = archivo
+            self.lbl_base.setText(
+                f"Base cargada: {os.path.basename(archivo)} "
+                f"({self.user_db.total} usuarios)"
+            )
+            self.lbl_base.setStyleSheet("color: #059669; font-size: 12px;")
+            self.btn_quitar_base.setEnabled(True)
+        except Exception as e:
+            self.user_db = None
+            self.ruta_base_usuarios = ""
+            QMessageBox.warning(self, "Base de usuarios", f"No se pudo cargar:\n{e}")
+
+    def quitar_base_usuarios(self):
+        self.user_db = None
+        self.ruta_base_usuarios = ""
+        self.lbl_base.setText("Sin base de usuarios cargada")
+        self.lbl_base.setStyleSheet("")
+        self.btn_quitar_base.setEnabled(False)
+
     def iniciar_procesamiento(self):
         self._set_busy(True)
         self.progressbar.setValue(0)
@@ -314,17 +528,24 @@ class AppOCR(QMainWindow):
         self.lbl_estado.setStyleSheet("color: #2563eb;")
         self.tiempo_inicio = time.time()
         modo = self._modo_actual()
+        modelo = self._modelo_actual()
 
         if self.tipo_procesamiento == "carpeta":
-            self.worker = WorkerThread(self.ruta_actual, modo)
+            self.worker = WorkerThread(
+                self.ruta_actual, modo, user_db=self.user_db, modelo=modelo,
+                progress_tracker=self.progress_tracker,
+                excel_callback=self._actualizar_excel_incremental,
+            )
             self.worker.progress_update.connect(self.actualizar_interfaz)
             self.worker.finished_success.connect(self.procesamiento_completado)
             self.worker.finished_error.connect(self.procesamiento_error)
+            self.worker.cuota_agotada.connect(self.manejar_cuota_agotada)
             self.worker.start()
         elif self.tipo_procesamiento == "archivo":
-            self.worker_ind = WorkerIndividual(self.ruta_actual, modo)
+            self.worker_ind = WorkerIndividual(self.ruta_actual, modo, user_db=self.user_db, modelo=modelo)
             self.worker_ind.finished_success.connect(self.procesamiento_individual_completado)
             self.worker_ind.finished_error.connect(self.procesamiento_error)
+            self.worker_ind.cuota_agotada.connect(self.manejar_cuota_individual)
             self.worker_ind.start()
             self.progressbar.setValue(50)
 
@@ -343,8 +564,11 @@ class AppOCR(QMainWindow):
 
         nueva_ruta = data.pop("__ruta_actualizada__", None)
         renombrado = data.pop("__renombrado__", False)
+        niu_origen = data.pop("__niu_origen__", None)
         data.pop("__incluir_excel__", None)
         data.pop("__nombre_sugerido__", None)
+        revisar_manual = data.get("Revisar_Manual") == "Sí"
+        motivo_revision = data.get("Motivo_Revision")
 
         if nueva_ruta:
             self.ruta_actual = nueva_ruta
@@ -360,6 +584,10 @@ class AppOCR(QMainWindow):
             df.to_excel(ruta_excel, index=False, engine="openpyxl")
             partes.append(f"Excel guardado en:\n{ruta_excel}")
 
+        if niu_origen:
+            origen_txt = _NIU_ORIGEN_TXT.get(niu_origen, niu_origen)
+            partes.append(f"NIU recuperado por: {origen_txt}.")
+
         if renombra_archivo(modo) and renombrado:
             partes.append(f"Archivo renombrado a:\n{os.path.basename(nueva_ruta or self.ruta_actual)}")
         elif renombra_archivo(modo) and not renombrado:
@@ -368,8 +596,14 @@ class AppOCR(QMainWindow):
         if not partes:
             partes.append("Procesamiento completado (solo renombrado, sin Excel).")
 
+        if revisar_manual:
+            partes.append(f"⚠ Revisar a mano: {motivo_revision or 'dato dudoso detectado'}")
+
         self.lbl_estado.setText("Completado\n\n" + "\n\n".join(partes))
-        self.lbl_estado.setStyleSheet("color: #059669; font-weight: 600;")
+        if revisar_manual:
+            self.lbl_estado.setStyleSheet("color: #d97706; font-weight: 600;")
+        else:
+            self.lbl_estado.setStyleSheet("color: #059669; font-weight: 600;")
 
     def procesamiento_completado(self, resultados):
         self._reactivar()
@@ -385,12 +619,37 @@ class AppOCR(QMainWindow):
         ok = [r for r in resultados if "Error" not in r]
         err = [r for r in resultados if "Error" in r]
         renombrados = sum(1 for r in ok if r.get("__renombrado__"))
+        niu_recuperados = sum(1 for r in ok if r.get("__niu_origen__"))
+        revisar = [r for r in ok if r.get("Revisar_Manual") == "Sí"]
 
         partes = [f"Tiempo: {texto_tiempo}", f"Procesados: {len(ok)} | Errores: {len(err)}"]
+        if niu_recuperados:
+            partes.append(f"NIU recuperados (archivo/base de usuarios): {niu_recuperados}")
+        if revisar:
+            partes.append(f"⚠ Para revisar a mano: {len(revisar)}")
 
         if exporta_excel(modo) and ok:
-            df = ordenar_dataframe(pd.DataFrame([limpiar_registro(r) for r in ok]))
+            # Cargar datos anteriores si existen (en caso de reanudación)
             ruta_excel = os.path.join(self.ruta_actual, "resultado_consolidado.xlsx")
+            datos_anteriores = []
+            if os.path.exists(ruta_excel):
+                try:
+                    df_anterior = pd.read_excel(ruta_excel)
+                    datos_anteriores = df_anterior.to_dict("records")
+                except Exception:
+                    pass
+
+            # Evitar duplicados: solo los nuevos archivos procesados
+            registros_nuevos = [limpiar_registro(r) for r in ok]
+            archivos_nuevos = {r.get("Archivo") for r in registros_nuevos}
+            datos_anteriores_filtrados = [
+                r for r in datos_anteriores
+                if r.get("Archivo") not in archivos_nuevos
+            ]
+
+            # Combinar y escribir
+            todos_datos = datos_anteriores_filtrados + registros_nuevos
+            df = ordenar_dataframe(pd.DataFrame(todos_datos))
             df.to_excel(ruta_excel, index=False, engine="openpyxl")
             partes.append(f"Excel:\n{ruta_excel}")
 
@@ -399,12 +658,58 @@ class AppOCR(QMainWindow):
 
         self.progressbar.setValue(100)
         self.lbl_estado.setText("\n\n".join(partes))
-        self.lbl_estado.setStyleSheet("color: #059669; font-weight: 600;")
+        if revisar:
+            self.lbl_estado.setStyleSheet("color: #d97706; font-weight: 600;")
+        else:
+            self.lbl_estado.setStyleSheet("color: #059669; font-weight: 600;")
 
     def procesamiento_error(self, error_msg):
         self._reactivar()
         self.lbl_estado.setText(f"Error: {error_msg}")
         self.lbl_estado.setStyleSheet("color: #dc2626; font-weight: 600;")
+
+    def _preguntar_cambio_api_key(self) -> str | None:
+        """Pregunta si quiere otra API key. Devuelve la nueva key o None."""
+        respuesta = QMessageBox.question(
+            self,
+            "Sin créditos en OpenRouter",
+            "La API key de OpenRouter se quedó sin créditos\n"
+            "y no es posible continuar con la clave actual.\n\n"
+            "¿Quieres ingresar otra API key para continuar?\n\n"
+            "Si eliges 'No', el proceso se detiene y se conserva\n"
+            "todo lo procesado hasta el momento.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if respuesta == QMessageBox.StandardButton.Yes:
+            if solicitar_y_guardar_api_key(self):
+                return resolve_api_key()
+        return None
+
+    def manejar_cuota_agotada(self):
+        """El lote queda en pausa hasta que el usuario decida."""
+        self.lbl_estado.setText("Proceso en pausa: sin créditos en OpenRouter.")
+        self.lbl_estado.setStyleSheet("color: #d97706; font-weight: 600;")
+
+        nueva_key = self._preguntar_cambio_api_key()
+        if nueva_key:
+            self.lbl_estado.setText("API key actualizada. Reanudando procesamiento...")
+            self.lbl_estado.setStyleSheet("color: #2563eb;")
+        else:
+            self.lbl_estado.setText("Deteniendo y guardando lo procesado...")
+            self.lbl_estado.setStyleSheet("color: #d97706; font-weight: 600;")
+        self.worker.responder_cuota(nueva_key)
+
+    def manejar_cuota_individual(self):
+        """Sin créditos procesando un archivo individual."""
+        self._reactivar()
+        self.progressbar.setValue(0)
+        self.lbl_estado.setText("Sin créditos en OpenRouter. El archivo no se procesó.")
+        self.lbl_estado.setStyleSheet("color: #d97706; font-weight: 600;")
+
+        nueva_key = self._preguntar_cambio_api_key()
+        if nueva_key:
+            self.iniciar_procesamiento()
 
     def configurar_api_key(self):
         if solicitar_y_guardar_api_key(self):

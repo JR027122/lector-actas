@@ -1,5 +1,5 @@
 """
-Almacenamiento de la API key de Gemini fuera del texto plano.
+Almacenamiento de la API key de OpenRouter fuera del texto plano.
 
 En Windows se usa el Administrador de credenciales (Credential Manager),
 donde el sistema operativo cifra el secreto. No es invulnerable a un atacante
@@ -9,8 +9,8 @@ archivo .env legible junto al ejecutable.
 
 import os
 
-SERVICE_NAME = "LectorActas_Gemini"
-ACCOUNT_NAME = "GEMINI_API_KEY"
+SERVICE_NAME = "LectorActas_OpenRouter"
+ACCOUNT_NAME = "OPENROUTER_API_KEY"
 
 
 def load_stored_api_key():
@@ -45,7 +45,7 @@ def resolve_api_key():
     Orden: variable de entorno (desarrollo / .env) → almacén del sistema.
     Devuelve la clave sin espacios o None.
     """
-    env_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    env_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
     if env_key:
         return env_key
     stored = (load_stored_api_key() or "").strip()

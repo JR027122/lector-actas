@@ -14,7 +14,7 @@ COLUMNAS_ORDENADAS = [
     "Corriente_Entrada_Bateria", "Corriente_Salida_Bateria",
     "Voltaje_Toma_1", "Voltaje_Toma_2", "Voltaje_Toma_3", "Voltaje_Toma_4",
     "Voltaje_Tierra_Neutro", "Latitud", "Longitud", "Observacion_General",
-    "Archivo",
+    "Revisar_Manual", "Motivo_Revision", "Archivo",
 ]
 
 
