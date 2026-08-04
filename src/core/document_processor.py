@@ -25,6 +25,52 @@ from src.utils.progress_tracker import ProgressTracker
 _MAX_WORKERS_DEFAULT = 3
 
 
+class ProcessControl:
+    """Control cooperativo de pausa/detención para el procesamiento por lotes.
+
+    El hilo de la interfaz llama a pausar()/reanudar()/detener(); cada worker
+    del lote llama a punto_de_control() antes de procesar un archivo: ese método
+    bloquea mientras esté en pausa y devuelve False si se pidió detener (para
+    que el worker omita el archivo y el pool se vacíe rápido).
+
+    Funciona igual con el procesamiento en paralelo: al pausar, los hilos en
+    curso terminan el archivo que tengan entre manos y luego se bloquean antes
+    del siguiente; los que estén en cola no arrancan trabajo pesado.
+    """
+
+    def __init__(self):
+        self._detener = threading.Event()
+        # "Continuar" arranca activo (procesando). Al pausar se limpia, lo que
+        # bloquea a los workers en punto_de_control() hasta reanudar o detener.
+        self._continuar = threading.Event()
+        self._continuar.set()
+
+    def pausar(self):
+        if not self._detener.is_set():
+            self._continuar.clear()
+
+    def reanudar(self):
+        self._continuar.set()
+
+    def detener(self):
+        self._detener.set()
+        # Desbloquear cualquier worker que estuviera esperando en pausa.
+        self._continuar.set()
+
+    @property
+    def pausado(self) -> bool:
+        return not self._continuar.is_set() and not self._detener.is_set()
+
+    @property
+    def detenido(self) -> bool:
+        return self._detener.is_set()
+
+    def punto_de_control(self) -> bool:
+        """Bloquea mientras esté en pausa. Devuelve False si se pidió detener."""
+        self._continuar.wait()
+        return not self._detener.is_set()
+
+
 def nombre_sugerido(data: dict, nombre_original: str) -> str | None:
     """Devuelve el nombre sugerido para descarga web (sin renombrar en disco)."""
     _, extension = os.path.splitext(nombre_original)
@@ -60,8 +106,9 @@ def process_document(
     if not solo_renombre:
         data = post_procesar(data)
 
-    # Completar NIU: primero desde el nombre del archivo original, y si no,
-    # desde la base de usuarios (cédula/nombre), cuando el OCR no lo encontró
+    # Completar NIU: primero desde el nombre del archivo original; si no, desde
+    # el propio acta (validando el rango); y como último recurso, desde la base
+    # de usuarios (cédula/nombre).
     data = completar_niu(data, user_db, nombre_archivo=filename)
 
     if renombra_archivo(mode):
@@ -95,6 +142,7 @@ def process_folder(
     progress_tracker: ProgressTracker | None = None,
     excel_callback=None,
     max_workers: int = _MAX_WORKERS_DEFAULT,
+    control: "ProcessControl | None" = None,
 ) -> list:
     """Procesa una carpeta completa con reintentos ante límites de la API.
 
@@ -110,6 +158,9 @@ def process_folder(
     progress_tracker: ProgressTracker para guardar progreso y permitir reanudación.
     excel_callback: función(resultados_acumulados, ruta_carpeta) que actualiza el Excel incrementalmente.
     max_workers: número de archivos que se procesan simultáneamente.
+    control: ProcessControl opcional para pausar/detener el lote desde la UI.
+    Al detener, se sale conservando lo procesado y sin borrar el checkpoint,
+    de modo que el lote pueda reanudarse después.
     """
     resultados = []
 
@@ -149,8 +200,21 @@ def process_folder(
     quota_triggered = [False]
     completed_count = [0]
 
-    def procesar_uno(filename: str) -> dict:
-        """Procesa un archivo con reintentos. Pensada para ejecutarse en un hilo."""
+    def _detencion_solicitada() -> bool:
+        """True si el usuario pidió detener el lote desde el control de la UI."""
+        return control is not None and control.detenido
+
+    def procesar_uno(filename: str) -> dict | None:
+        """Procesa un archivo con reintentos. Pensada para ejecutarse en un hilo.
+
+        Devuelve None si el archivo se omite por una detención del usuario (en
+        ese caso no se añade a resultados ni al checkpoint).
+        """
+        # Pausa / detención cooperativa desde la UI. punto_de_control bloquea
+        # mientras esté en pausa y devuelve False si se pidió detener.
+        if control is not None and not control.punto_de_control():
+            return None
+
         if stop_event.is_set():
             return {
                 "Archivo": filename,
@@ -161,6 +225,11 @@ def process_folder(
 
         intentos = 0
         while intentos < 4:
+            # Volver a comprobar pausa/detención antes de cada intento (una
+            # pausa puede ocurrir entre reintentos por rate limit).
+            if control is not None and not control.punto_de_control():
+                return None
+
             if stop_event.is_set():
                 return {
                     "Archivo": filename,
@@ -262,8 +331,14 @@ def process_folder(
                 if progress_callback:
                     progress_callback(current, total_archivos, filename)
 
-    # Limpiar checkpoint si se completó exitosamente
-    if progress_tracker and not cuota_agotada[0] and total_archivos > 0:
+    # Limpiar checkpoint solo si se completó todo el lote. Si el usuario detuvo
+    # o se agotó la cuota, se conserva para poder reanudar más tarde.
+    if (
+        progress_tracker
+        and not cuota_agotada[0]
+        and not _detencion_solicitada()
+        and total_archivos > 0
+    ):
         progress_tracker.delete()
 
     return resultados

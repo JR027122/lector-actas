@@ -21,10 +21,12 @@ import pandas as pd
 # Umbral de similitud para coincidencia de nombres (0-1)
 NAME_MATCH_CUTOFF = 0.87
 
-# Rango vigente de NIU de la organización. Ajusta estos límites si el rango
-# cambia; se usan para reconocer un NIU válido dentro del nombre del archivo.
+# Rango vigente de NIU de la organización (ambos límites inclusive). Ajusta
+# estos límites si el rango cambia; se usan para reconocer un NIU válido tanto
+# en el nombre del archivo como dentro del acta. Fuera de este rango un número
+# NO se considera un NIU (ni un número menos, ni uno más).
 NIU_MIN = 86320021
-NIU_MAX = 99025271
+NIU_MAX = 99024940
 
 _DIGIT_RUN = re.compile(r"\d+")
 _SUFIJO_DUPLICADO = re.compile(r"\s*\(\d+\)\s*$")
@@ -49,6 +51,21 @@ def _solo_digitos(valor) -> str:
     if valor is None:
         return ""
     return re.sub(r"\D", "", str(valor))
+
+
+def niu_en_rango(valor) -> bool:
+    """True si `valor` es un NIU dentro del rango válido [NIU_MIN, NIU_MAX].
+
+    Toma solo los dígitos del valor recibido. Fuera del rango (o sin dígitos)
+    el número no se considera un NIU válido: ni un número menos, ni uno más.
+    """
+    digitos = _solo_digitos(valor)
+    if not digitos:
+        return False
+    try:
+        return NIU_MIN <= int(digitos) <= NIU_MAX
+    except ValueError:
+        return False
 
 
 def _detectar_columna(df: pd.DataFrame, candidatas: tuple) -> str | None:
@@ -200,107 +217,124 @@ def _marcar_para_revisar(data: dict, mensaje: str) -> None:
     data["Motivo_Revision"] = "; ".join(p for p in (existente, mensaje) if p)
 
 
+def _validar_niu_contra_base(
+    data: dict, niu: str, user_db: "UserDatabase | None", fuente: str
+) -> None:
+    """Valida un NIU (ya en rango) contra la base de usuarios y marca revisión.
+
+    `fuente` es un texto legible del origen del NIU ("nombre del archivo" o
+    "acta") que se usa en los mensajes y en el motivo de revisión.
+
+    - Sin base cargada: no hay nada contra qué contrastar, se acepta.
+    - El NIU aparece en la base: confirmado.
+    - La base tiene otro NIU para esa cédula/nombre: se conserva el de la
+      `fuente` (es la fuente directa) pero se marca para revisión manual.
+    - No aparece por ningún lado: se conserva pero se marca para revisión.
+    """
+    if user_db is None:
+        print(f"NIU {niu} tomado del {fuente}.")
+        return
+
+    if user_db.contiene_niu(niu):
+        print(f"NIU {niu} tomado del {fuente} (validado contra la base).")
+        return
+
+    niu_bd, metodo_bd = user_db.buscar_niu(
+        cedula=data.get("Cedula_Usuario"),
+        nombre=data.get("Nombre_Usuario"),
+    )
+    if niu_bd and _solo_digitos(niu_bd) == _solo_digitos(niu):
+        print(f"NIU {niu} tomado del {fuente} (confirmado por {metodo_bd} en la base).")
+        return
+
+    if niu_bd:
+        print(
+            f"Advertencia: el NIU '{niu}' del {fuente} no coincide con el NIU "
+            f"'{niu_bd}' de la base (por {metodo_bd}). Se usa el del {fuente}."
+        )
+        _marcar_para_revisar(
+            data,
+            f"NIU del {fuente} ({niu}) no coincide con el de la base de usuarios "
+            f"({niu_bd}, por {metodo_bd})",
+        )
+        return
+
+    print(
+        f"Advertencia: NIU '{niu}' del {fuente} no aparece en la base de usuarios "
+        "y no se encontró por cédula ni nombre."
+    )
+    _marcar_para_revisar(
+        data, f"NIU del {fuente} ({niu}) no está en la base de usuarios"
+    )
+
+
 def completar_niu(
     data: dict,
     user_db: "UserDatabase | None" = None,
     nombre_archivo: str | None = None,
 ) -> dict:
-    """Completa o corrige el NIU del registro OCR.
+    """Determina el NIU del registro para poder renombrar el acta.
 
-    Orden de recuperación cuando falta el NIU (o el que trajo el OCR no
-    existe en la base de usuarios):
-    1. Nombre del archivo original — la fuente más confiable cuando quien
-       organizó las actas ya puso el NIU ahí. Funciona incluso sin base
-       de usuarios cargada.
-    2. Base de usuarios por cédula o nombre (si se cargó una).
+    Orden de búsqueda:
+    1. Nombre del archivo original — fuente PRIORITARIA. Quien organizó las
+       actas suele poner ahí el NIU; se reconoce un número dentro del rango
+       válido [NIU_MIN, NIU_MAX]. Funciona incluso sin base de usuarios.
+    2. Dentro del acta — el NIU que extrajo el OCR, aceptado SOLO si cae en el
+       rango válido [NIU_MIN, NIU_MAX]. Un número fuera del rango no es un NIU.
+    3. Base de usuarios por cédula o nombre (si se cargó una), como último
+       recurso cuando ni el nombre ni el acta dieron un NIU válido.
 
-    IMPORTANTE: si hay una base de usuarios cargada, el NIU recuperado del
-    nombre del archivo SIEMPRE se valida contra ella (no se usa a ciegas
-    solo porque venía en el nombre). Si no coincide con lo que dice la
-    base, se sigue usando el del archivo (es la fuente más directa), pero
-    el registro queda marcado en Revisar_Manual/Motivo_Revision para que
-    lo confirmes a mano.
+    IMPORTANTE: si hay una base de usuarios cargada, el NIU tomado del nombre
+    del archivo o del acta SIEMPRE se valida contra ella. Si no coincide, se
+    conserva el de la fuente directa pero el registro queda marcado en
+    Revisar_Manual/Motivo_Revision para confirmarlo a mano.
 
     Marca data['__niu_origen__'] = 'nombre_archivo' | 'cedula' | 'nombre'
-    según de dónde se recuperó.
+    cuando el NIU se recuperó de una fuente distinta al propio acta.
     """
-    niu_actual = str(data.get("NIU") or "").strip()
-    if niu_actual.lower() in ("nan", "none", "null"):
-        niu_actual = ""
+    niu_acta = str(data.get("NIU") or "").strip()
+    if niu_acta.lower() in ("nan", "none", "null"):
+        niu_acta = ""
 
-    # NIU presente y confirmado en la base (si hay una cargada): nada que hacer
-    if niu_actual and (user_db is None or user_db.contiene_niu(niu_actual)):
-        return data
-
-    niu_archivo = extraer_niu_de_nombre_archivo(nombre_archivo) if not niu_actual else None
-
+    # 1. Nombre del archivo (fuente prioritaria). extraer_niu_de_nombre_archivo
+    #    solo devuelve números dentro del rango válido.
+    niu_archivo = extraer_niu_de_nombre_archivo(nombre_archivo)
     if niu_archivo:
         data["NIU"] = niu_archivo
         data["__niu_origen__"] = "nombre_archivo"
+        _validar_niu_contra_base(data, niu_archivo, user_db, "nombre del archivo")
+        return data
 
-        if user_db is None:
-            print(f"NIU {niu_archivo} recuperado del nombre del archivo original.")
-            return data
+    # 2. Dentro del acta: solo se acepta si está en el rango válido.
+    if niu_acta and niu_en_rango(niu_acta):
+        data["NIU"] = niu_acta
+        _validar_niu_contra_base(data, niu_acta, user_db, "acta")
+        return data
 
-        # Hay base de usuarios: se valida el NIU del archivo contra ella,
-        # en vez de confiar en él a ciegas.
-        if user_db.contiene_niu(niu_archivo):
-            print(f"NIU {niu_archivo} recuperado del nombre del archivo original (validado contra la base).")
-            return data
+    if niu_acta:
+        print(
+            f"NIU '{niu_acta}' del acta está fuera del rango válido "
+            f"({NIU_MIN}-{NIU_MAX}); no se usa como NIU."
+        )
 
-        niu_bd, metodo_bd = user_db.buscar_niu(
+    # 3. Base de usuarios por cédula o nombre (último recurso).
+    if user_db is not None:
+        niu_bd, metodo = user_db.buscar_niu(
             cedula=data.get("Cedula_Usuario"),
             nombre=data.get("Nombre_Usuario"),
         )
-        if niu_bd and _solo_digitos(niu_bd) == _solo_digitos(niu_archivo):
-            print(
-                f"NIU {niu_archivo} recuperado del nombre del archivo original "
-                f"(confirmado por {metodo_bd} en la base)."
-            )
-            return data
-
         if niu_bd:
-            print(
-                f"Advertencia: el NIU '{niu_archivo}' del nombre del archivo no coincide "
-                f"con el NIU '{niu_bd}' de la base (por {metodo_bd}). Se usa el del archivo."
-            )
-            _marcar_para_revisar(
-                data,
-                f"NIU del nombre del archivo ({niu_archivo}) no coincide con el de la "
-                f"base de usuarios ({niu_bd}, por {metodo_bd})",
-            )
+            print(f"NIU {niu_bd} recuperado de la base de usuarios (por {metodo}).")
+            data["NIU"] = niu_bd
+            data["__niu_origen__"] = metodo
             return data
 
-        print(
-            f"Advertencia: NIU '{niu_archivo}' recuperado del nombre del archivo no "
-            "aparece en la base de usuarios y no se encontró por cédula ni nombre."
-        )
+    # No se pudo determinar un NIU válido. Si el acta traía uno fuera de rango,
+    # se conserva para no perder el dato, pero se marca para revisión manual.
+    if niu_acta and not niu_en_rango(niu_acta):
         _marcar_para_revisar(
-            data, f"NIU del nombre del archivo ({niu_archivo}) no está en la base de usuarios"
-        )
-        return data
-
-    if user_db is None:
-        return data
-
-    niu, metodo = user_db.buscar_niu(
-        cedula=data.get("Cedula_Usuario"),
-        nombre=data.get("Nombre_Usuario"),
-    )
-    if niu:
-        if niu_actual and _solo_digitos(niu_actual) != _solo_digitos(niu):
-            print(
-                f"NIU '{niu_actual}' del OCR no existe en la base; "
-                f"corregido a {niu} (por {metodo})."
-            )
-        else:
-            print(f"NIU {niu} recuperado de la base de usuarios (por {metodo}).")
-        data["NIU"] = niu
-        data["__niu_origen__"] = metodo
-    elif niu_actual:
-        # NIU del OCR no está en la base y no se pudo verificar: avisar
-        print(
-            f"Advertencia: NIU '{niu_actual}' no aparece en la base de usuarios "
-            "y no se encontró por cédula ni nombre. Se usa tal cual."
+            data,
+            f"NIU '{niu_acta}' del acta está fuera del rango válido "
+            f"({NIU_MIN}-{NIU_MAX})",
         )
     return data
