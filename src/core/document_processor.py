@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 import pandas as pd
 
@@ -9,6 +10,48 @@ from src.utils.niu_lookup import completar_niu
 from src.utils.post_procesado import post_procesar
 from src.utils.excel_export import limpiar_registro, ordenar_dataframe
 from src.utils.progress_tracker import ProgressTracker
+
+
+class ProcessControl:
+    """Control cooperativo de pausa/detención para el procesamiento por lotes.
+
+    El hilo de la interfaz llama a pausar()/reanudar()/detener(); el bucle de
+    procesamiento llama a punto_de_control() entre archivos: ese método bloquea
+    mientras esté en pausa y devuelve False si se pidió detener (para salir del
+    bucle conservando lo ya procesado).
+    """
+
+    def __init__(self):
+        self._detener = threading.Event()
+        # "Continuar" arranca activo (procesando). Al pausar se limpia, lo que
+        # bloquea el bucle en punto_de_control() hasta reanudar o detener.
+        self._continuar = threading.Event()
+        self._continuar.set()
+
+    def pausar(self):
+        if not self._detener.is_set():
+            self._continuar.clear()
+
+    def reanudar(self):
+        self._continuar.set()
+
+    def detener(self):
+        self._detener.set()
+        # Desbloquear el bucle si estaba esperando en pausa.
+        self._continuar.set()
+
+    @property
+    def pausado(self) -> bool:
+        return not self._continuar.is_set() and not self._detener.is_set()
+
+    @property
+    def detenido(self) -> bool:
+        return self._detener.is_set()
+
+    def punto_de_control(self) -> bool:
+        """Bloquea mientras esté en pausa. Devuelve False si se pidió detener."""
+        self._continuar.wait()
+        return not self._detener.is_set()
 
 
 def nombre_sugerido(data: dict, nombre_original: str) -> str | None:
@@ -40,8 +83,9 @@ def process_document(
     # sospechosas (posibles datos inventados por el modelo)
     data = post_procesar(data)
 
-    # Completar NIU: primero desde el nombre del archivo original, y si no,
-    # desde la base de usuarios (cédula/nombre), cuando el OCR no lo encontró
+    # Completar NIU: primero desde el nombre del archivo original; si no,
+    # desde el propio acta (validando el rango); y como último recurso, desde
+    # la base de usuarios (cédula/nombre).
     data = completar_niu(data, user_db, nombre_archivo=filename)
 
     if renombra_archivo(mode):
@@ -74,6 +118,7 @@ def process_folder(
     modelo: str | None = None,
     progress_tracker: ProgressTracker | None = None,
     excel_callback=None,
+    control: "ProcessControl | None" = None,
 ) -> list:
     """Procesa una carpeta completa con reintentos ante límites de la API.
 
@@ -83,6 +128,9 @@ def process_folder(
     modelo: slug de OpenRouter elegido por el usuario (ver openrouter_processor.MODELOS_DISPONIBLES).
     progress_tracker: ProgressTracker para guardar progreso y permitir reanudación.
     excel_callback: función(resultados_acumulados, ruta_carpeta) que actualiza el Excel incrementalmente.
+    control: ProcessControl opcional para pausar/detener el lote desde la UI.
+    Al detener, se sale conservando lo procesado y sin borrar el checkpoint,
+    de modo que el lote pueda reanudarse después.
     """
     resultados = []
 
@@ -111,8 +159,15 @@ def process_folder(
         return resultados
 
     cuota_diaria_agotada = False
+    detenido_por_usuario = False
 
     for i, filename in enumerate(archivos):
+        # Pausa / detención cooperativa solicitada desde la UI. punto_de_control
+        # bloquea mientras esté en pausa y devuelve False si se pidió detener.
+        if control is not None and not control.punto_de_control():
+            detenido_por_usuario = True
+            break
+
         file_path = os.path.join(folder_path, filename)
 
         if cuota_diaria_agotada:
@@ -188,8 +243,14 @@ def process_folder(
         if i < total_archivos - 1 and not cuota_diaria_agotada:
             time.sleep(4)
 
-    # Limpiar checkpoint si se completó exitosamente
-    if progress_tracker and not cuota_diaria_agotada and total_archivos > 0:
+    # Limpiar checkpoint solo si se completó todo el lote. Si el usuario detuvo
+    # o se agotó la cuota, se conserva para poder reanudar más tarde.
+    if (
+        progress_tracker
+        and not cuota_diaria_agotada
+        and not detenido_por_usuario
+        and total_archivos > 0
+    ):
         progress_tracker.delete()
 
     return resultados

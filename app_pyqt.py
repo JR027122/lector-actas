@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl
 from PyQt6.QtGui import QFont, QDesktopServices
 
-from src.core.document_processor import process_document, process_folder
+from src.core.document_processor import ProcessControl, process_document, process_folder
 from src.core.openrouter_processor import MODELO_POR_DEFECTO, MODELOS_DISPONIBLES
 from src.core.processing_modes import MODE_OPTIONS, OCR_AND_RENAME, exporta_excel, renombra_archivo
 from src.utils.excel_export import limpiar_registro, ordenar_dataframe
@@ -68,6 +68,18 @@ QPushButton#secondaryBtn {
     padding: 10px 16px;
 }
 QPushButton#secondaryBtn:hover { background: #f8fafc; border-color: #2563eb; color: #2563eb; }
+QPushButton#secondaryBtn:disabled { color: #94a3b8; border-color: #e2e8f0; background: #f8fafc; }
+QPushButton#dangerBtn {
+    background: white;
+    color: #dc2626;
+    border: 1px solid #fca5a5;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 10px 16px;
+}
+QPushButton#dangerBtn:hover { background: #fef2f2; border-color: #dc2626; }
+QPushButton#dangerBtn:disabled { color: #94a3b8; border-color: #e2e8f0; background: #f8fafc; }
 QProgressBar {
     border: none;
     border-radius: 6px;
@@ -187,8 +199,21 @@ class WorkerThread(QThread):
         self.modelo = modelo
         self.progress_tracker = progress_tracker
         self.excel_callback = excel_callback
+        self.control = ProcessControl()
         self._evento_respuesta = threading.Event()
         self._nueva_api_key = None
+
+    def pausar(self):
+        self.control.pausar()
+
+    def reanudar(self):
+        self.control.reanudar()
+
+    def detener(self):
+        self.control.detener()
+        # Si estaba pausado esperando por falta de créditos, desbloquear también.
+        self._nueva_api_key = None
+        self._evento_respuesta.set()
 
     def responder_cuota(self, nueva_api_key):
         """Llamado desde la UI con la nueva key (o None para detener)."""
@@ -212,7 +237,7 @@ class WorkerThread(QThread):
                 self.folder_path, mode=self.mode, progress_callback=callback,
                 user_db=self.user_db, quota_callback=self._quota_callback,
                 modelo=self.modelo, progress_tracker=self.progress_tracker,
-                excel_callback=self.excel_callback,
+                excel_callback=self.excel_callback, control=self.control,
             )
             self.finished_success.emit(resultados)
         except Exception as e:
@@ -408,6 +433,23 @@ class AppOCR(QMainWindow):
         self.lbl_estado.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_estado.setWordWrap(True)
         prog_layout.addWidget(self.lbl_estado)
+
+        # Controles de pausa/detención (solo visibles durante el lote de carpeta)
+        control_row = QHBoxLayout()
+        control_row.addStretch()
+        self.btn_pausar = QPushButton("Pausar")
+        self.btn_pausar.setObjectName("secondaryBtn")
+        self.btn_pausar.clicked.connect(self.alternar_pausa)
+        self.btn_detener = QPushButton("Detener")
+        self.btn_detener.setObjectName("dangerBtn")
+        self.btn_detener.clicked.connect(self.detener_procesamiento)
+        self.btn_pausar.hide()
+        self.btn_detener.hide()
+        control_row.addWidget(self.btn_pausar)
+        control_row.addWidget(self.btn_detener)
+        control_row.addStretch()
+        prog_layout.addLayout(control_row)
+
         root.addWidget(prog_card)
 
     def _modo_actual(self) -> str:
@@ -541,6 +583,7 @@ class AppOCR(QMainWindow):
             self.worker.finished_error.connect(self.procesamiento_error)
             self.worker.cuota_agotada.connect(self.manejar_cuota_agotada)
             self.worker.start()
+            self._mostrar_controles_lote(True)
         elif self.tipo_procesamiento == "archivo":
             self.worker_ind = WorkerIndividual(self.ruta_actual, modo, user_db=self.user_db, modelo=modelo)
             self.worker_ind.finished_success.connect(self.procesamiento_individual_completado)
@@ -551,11 +594,69 @@ class AppOCR(QMainWindow):
 
     def actualizar_interfaz(self, actual, total, filename):
         self.progressbar.setValue(int((actual / total) * 100))
+        # Si se pausó justo después de terminar un archivo, no pisar el aviso de pausa.
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.control.pausado:
+            return
         self.lbl_estado.setText(f"Procesando: {filename} ({actual} de {total})")
+
+    def _mostrar_controles_lote(self, mostrar: bool):
+        """Muestra u oculta los botones de Pausar/Detener del lote de carpeta."""
+        if mostrar:
+            self.btn_pausar.setText("Pausar")
+            self.btn_pausar.setEnabled(True)
+            self.btn_pausar.show()
+            self.btn_detener.setEnabled(True)
+            self.btn_detener.show()
+        else:
+            self.btn_pausar.hide()
+            self.btn_detener.hide()
+
+    def alternar_pausa(self):
+        """Pausa o reanuda el lote en curso."""
+        worker = getattr(self, "worker", None)
+        if worker is None or not worker.isRunning():
+            return
+        if worker.control.pausado:
+            worker.reanudar()
+            self.btn_pausar.setText("Pausar")
+            self.lbl_estado.setText("Reanudando procesamiento...")
+            self.lbl_estado.setStyleSheet("color: #2563eb;")
+        else:
+            worker.pausar()
+            self.btn_pausar.setText("Reanudar")
+            self.lbl_estado.setText(
+                "En pausa (se completa el archivo en curso).\n"
+                "Pulsa 'Reanudar' para continuar."
+            )
+            self.lbl_estado.setStyleSheet("color: #d97706; font-weight: 600;")
+
+    def detener_procesamiento(self):
+        """Detiene el lote conservando lo ya procesado (se puede reanudar)."""
+        worker = getattr(self, "worker", None)
+        if worker is None or not worker.isRunning():
+            return
+        respuesta = QMessageBox.question(
+            self,
+            "Detener procesamiento",
+            "¿Seguro que quieres detener el procesamiento?\n\n"
+            "Se conservará todo lo procesado hasta ahora y podrás reanudar "
+            "esta carpeta más tarde desde donde se quedó.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if respuesta != QMessageBox.StandardButton.Yes:
+            return
+        worker.detener()
+        self.btn_pausar.setEnabled(False)
+        self.btn_detener.setEnabled(False)
+        self.lbl_estado.setText("Deteniendo... (se completa el archivo en curso)")
+        self.lbl_estado.setStyleSheet("color: #d97706; font-weight: 600;")
 
     def _reactivar(self):
         self._set_busy(False)
         self.btn_procesar.setEnabled(bool(self.ruta_actual))
+        self._mostrar_controles_lote(False)
 
     def procesamiento_individual_completado(self, data):
         self._reactivar()
@@ -606,13 +707,21 @@ class AppOCR(QMainWindow):
             self.lbl_estado.setStyleSheet("color: #059669; font-weight: 600;")
 
     def procesamiento_completado(self, resultados):
+        worker = getattr(self, "worker", None)
+        detenido = worker is not None and worker.control.detenido
         self._reactivar()
         modo = self._modo_actual()
         segundos = int(time.time() - self.tiempo_inicio)
         texto_tiempo = f"{segundos // 60} min y {segundos % 60} seg" if segundos >= 60 else f"{segundos} s"
 
         if not resultados:
-            self.lbl_estado.setText("No se encontraron documentos válidos.")
+            if detenido:
+                self.lbl_estado.setText(
+                    "⏹ Procesamiento detenido. No se alcanzó a procesar ningún archivo.\n"
+                    "Puedes reanudar esta carpeta más tarde."
+                )
+            else:
+                self.lbl_estado.setText("No se encontraron documentos válidos.")
             self.lbl_estado.setStyleSheet("color: #d97706;")
             return
 
@@ -622,7 +731,9 @@ class AppOCR(QMainWindow):
         niu_recuperados = sum(1 for r in ok if r.get("__niu_origen__"))
         revisar = [r for r in ok if r.get("Revisar_Manual") == "Sí"]
 
-        partes = [f"Tiempo: {texto_tiempo}", f"Procesados: {len(ok)} | Errores: {len(err)}"]
+        encabezado = "⏹ Procesamiento detenido (se guardó lo procesado)" if detenido else None
+        partes = [p for p in (encabezado,) if p]
+        partes += [f"Tiempo: {texto_tiempo}", f"Procesados: {len(ok)} | Errores: {len(err)}"]
         if niu_recuperados:
             partes.append(f"NIU recuperados (archivo/base de usuarios): {niu_recuperados}")
         if revisar:
@@ -656,9 +767,10 @@ class AppOCR(QMainWindow):
         if renombra_archivo(modo):
             partes.append(f"Archivos renombrados: {renombrados}")
 
-        self.progressbar.setValue(100)
+        if not detenido:
+            self.progressbar.setValue(100)
         self.lbl_estado.setText("\n\n".join(partes))
-        if revisar:
+        if revisar or detenido:
             self.lbl_estado.setStyleSheet("color: #d97706; font-weight: 600;")
         else:
             self.lbl_estado.setStyleSheet("color: #059669; font-weight: 600;")
@@ -717,6 +829,14 @@ class AppOCR(QMainWindow):
                 self, "API key",
                 "Clave guardada en el Administrador de credenciales de Windows.",
             )
+
+    def closeEvent(self, event):
+        """Detiene el hilo del lote antes de cerrar (por si está en pausa)."""
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.isRunning():
+            worker.detener()
+            worker.wait(3000)
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":
