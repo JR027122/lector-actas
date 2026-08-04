@@ -2,7 +2,7 @@ import pandas as pd
 
 COLUMNAS_ORDENADAS = [
     "NIU", "Nombre_Usuario", "Cedula_Usuario", "Municipio", "Vereda",
-    "Fecha", "Hora", "Condicion_Climatica",
+    "Fecha", "Hora", "Condicion_Climatica", "Sistema_Activo",
     "Panel_1_Serie", "Panel_1_Estado", "Panel_1_Obs",
     "Panel_2_Serie", "Panel_2_Estado", "Panel_2_Obs",
     "Panel_3_Serie", "Panel_3_Estado", "Panel_3_Obs",

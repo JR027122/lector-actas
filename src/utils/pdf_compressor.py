@@ -74,11 +74,66 @@ def comprimir_pdf(file_path: str) -> str:
         documento.close()
 
 
-def preparar_para_envio(file_path: str) -> tuple[str, bool]:
+def extraer_primera_pagina(file_path: str) -> tuple[str, bool]:
+    """Extrae solo la primera página de un PDF a un archivo temporal.
+
+    Para renombre basta con NIU y Fecha, que suelen estar en la portada.
+    Enviar 1 página en vez del PDF completo (a veces 10+ páginas escaneadas)
+    reduce mucho el tiempo y el costo de la API.
+
+    Devuelve (ruta, es_temporal). Si no es PDF o falla, devuelve el original.
+    """
+    if not file_path.lower().endswith(".pdf"):
+        return file_path, False
+
+    try:
+        documento = fitz.open(file_path)
+    except Exception as e:
+        print(f"No se pudo abrir el PDF para extraer la 1ª página: {e}")
+        return file_path, False
+
+    try:
+        if documento.page_count <= 1:
+            return file_path, False
+
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(tmp_fd)
+
+        salida = fitz.open()
+        try:
+            salida.insert_pdf(documento, from_page=0, to_page=0)
+            salida.save(tmp_path, garbage=4, deflate=True)
+        finally:
+            salida.close()
+
+        print(
+            f"Renombre rápido: enviando solo 1ª página "
+            f"(de {documento.page_count}) de {os.path.basename(file_path)}"
+        )
+        return tmp_path, True
+    except Exception as e:
+        print(f"No se pudo extraer la 1ª página: {e}")
+        return file_path, False
+    finally:
+        documento.close()
+
+
+def preparar_para_envio(file_path: str, solo_primera_pagina: bool = False) -> tuple[str, bool]:
     """Devuelve (ruta_a_subir, es_temporal).
 
+    Si solo_primera_pagina=True (modo renombre), reduce el PDF a la portada.
     Si el PDF supera el límite práctico, devuelve una copia comprimida temporal.
     """
+    if solo_primera_pagina and file_path.lower().endswith(".pdf"):
+        ruta, es_temp = extraer_primera_pagina(file_path)
+        # Si la 1ª página sigue pesando (poco habitual), comprimirla
+        if necesita_compresion(ruta):
+            comprimido = comprimir_pdf(ruta)
+            if es_temp and os.path.exists(ruta):
+                os.remove(ruta)
+            return comprimido, True
+        return ruta, es_temp
+
     if necesita_compresion(file_path):
         return comprimir_pdf(file_path), True
     return file_path, False

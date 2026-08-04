@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import sys
+import threading
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -17,6 +18,27 @@ ruta_env = os.path.join(base_dir, ".env")
 load_dotenv(ruta_env)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+# --- Cache de clientes OpenAI (reutilización de conexiones HTTP) ---
+# El cliente OpenAI (httpx) mantiene un pool de conexiones y es thread-safe.
+# Reutilizarlo evita el overhead de TLS handshake en cada llamada a la API.
+_cliente_cache: dict[str, OpenAI] = {}
+_cliente_lock = threading.Lock()
+
+
+def _obtener_cliente(api_key: str) -> OpenAI:
+    """Devuelve un cliente OpenAI reutilizable por API key (thread-safe)."""
+    cliente = _cliente_cache.get(api_key)
+    if cliente is not None:
+        return cliente
+    with _cliente_lock:
+        # Doble verificación por si otro thread lo creó mientras esperábamos el lock.
+        cliente = _cliente_cache.get(api_key)
+        if cliente is not None:
+            return cliente
+        cliente = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=api_key)
+        _cliente_cache[api_key] = cliente
+        return cliente
 
 
 def _resolve_openrouter_api_key():
@@ -132,43 +154,7 @@ def _codificar_archivo(ruta_archivo: str) -> dict:
     return {"type": "image_url", "image_url": {"url": data_uri}}
 
 
-def extract_data_with_ai(file_path, filename, api_key=None, modelo=None):
-    """Extrae los datos del acta usando un modelo de OpenRouter (por defecto Gemini).
-
-    Usa la API de OpenRouter (compatible con OpenAI), que no tiene una API de
-    archivos propia como la de Google, así que el documento se envía
-    codificado en base64 dentro del mensaje.
-
-    modelo: slug de OpenRouter elegido por el usuario (ver MODELOS_DISPONIBLES).
-    Si no se indica, o ya no existe (404), se usa MODELO_POR_DEFECTO / el
-    siguiente modelo disponible.
-    """
-    print(f"Procesando {filename} con OpenRouter...")
-
-    ruta_subida = file_path
-    es_temporal = False
-    try:
-        api_key_segura = (api_key or "").strip() or _resolve_openrouter_api_key()
-        if not api_key_segura:
-            return {
-                "Archivo": filename,
-                "Error": (
-                    "No hay API key de OpenRouter. Configúrala en la aplicación "
-                    f"o crea un archivo .env en: {ruta_env}"
-                ),
-            }
-
-        cliente = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=api_key_segura)
-
-        # Los PDFs muy pesados (registros fotográficos escaneados) conviene
-        # comprimirlos antes de codificarlos en base64.
-        from src.utils.pdf_compressor import preparar_para_envio
-
-        ruta_subida, es_temporal = preparar_para_envio(file_path)
-
-        parte_archivo = _codificar_archivo(ruta_subida)
-
-        prompt = """
+_PROMPT_COMPLETO = """
         Eres un asistente experto en extracción de datos de actas técnicas de energía solar.
         Analiza el documento adjunto y extrae la información solicitada.
 
@@ -179,8 +165,9 @@ def extract_data_with_ai(file_path, filename, api_key=None, modelo=None):
         4. Limpia los nombres propios de basura (ej. si dice '~CEDULA' ignora ese símbolo).
         5. Presta extrema atención a la diferencia entre números y letras (ej. el número 0 y la letra O) específicamente en Cédula, NIU y Seriales.
         6. Transcribe las 'Observaciones' exactamente como están escritas, incluso si contienen errores ortográficos propios de la escritura a mano.
-        7. Busca la 'Observacion_General' en la última página del documento, suele ser un párrafo manuscrito importante.
+        7. MUY IMPORTANTE sobre 'Observacion_General': busca el campo etiquetado literalmente 'Observaciones:' (suele estar en la última página o junto a las firmas, con texto MANUSCRITO por el técnico). Transcribe únicamente ese texto manuscrito. NUNCA uses como observación el texto impreso de secciones como 'CONTRATO DE CONDICIONES UNIFORMES', 'CUADRO DE CARGAS' ni ningún otro texto legal o impreso del formato — eso NO es una observación. La observación general es SIEMPRE un texto escrito a mano, nunca texto impreso del formulario.
         8. MUY IMPORTANTE sobre el NIU: extráelo SOLO si aparece explícitamente en el documento con la etiqueta 'NIU' (suele ser un número de 6 a 10 dígitos). NUNCA uses como NIU el número del acta, el consecutivo del documento, la numeración de páginas ni ningún número del nombre del archivo. Si no hay un campo NIU visible y diligenciado, devuelve null.
+        9. Sistema_Activo: busca el checkbox '¿Operativo el sistema?' que suele estar en la primera página. Devuelve 'Sí' o 'No' según esté marcado. Si no encuentras el campo, devuelve null.
 
         Estructura JSON requerida:
         {
@@ -192,6 +179,7 @@ def extract_data_with_ai(file_path, filename, api_key=None, modelo=None):
             "Fecha": "fecha",
             "Hora": "hora",
             "Condicion_Climatica": "clima",
+            "Sistema_Activo": "Sí o No",
             "Panel_1_Serie": "SR-número",
             "Panel_1_Estado": "estado",
             "Panel_1_Obs": "observación",
@@ -225,9 +213,82 @@ def extract_data_with_ai(file_path, filename, api_key=None, modelo=None):
             "Voltaje_Tierra_Neutro": "medición numérica",
             "Latitud": "coordenada",
             "Longitud": "coordenada",
-            "Observacion_General": "texto completo de la observación al final del documento"
+            "Observacion_General": "texto manuscrito bajo el label 'Observaciones:' (NO texto impreso del formulario)"
         }
         """
+
+# Solo lo necesario para renombrar a NIU_dd-mm-aaaa_acta (mucho más rápido).
+_PROMPT_RENOMBRE = """
+        Eres un asistente experto en lectura de actas técnicas de energía solar.
+        Tu ÚNICO objetivo es obtener los datos para renombrar el archivo.
+        Analiza la portada / primera página del documento adjunto.
+
+        Reglas estrictas:
+        1. Devuelve ÚNICAMENTE un objeto JSON válido, sin markdown ni texto adicional.
+        2. Si no encuentras un dato, usa null.
+        3. Fecha: busca el campo Fecha del acta (suele estar arriba o en el encabezado).
+           Devuélvela preferiblemente como dd-mm-aaaa o dd/mm/aaaa. No inventes el mes ni el año.
+        4. NIU: extráelo SOLO si aparece con la etiqueta 'NIU' en el documento
+           (número de 6 a 10 dígitos). NUNCA uses el número del acta, consecutivos,
+           páginas ni números del nombre del archivo. Si no hay NIU visible, null.
+        5. Nombre_Usuario y Cedula_Usuario: extráelos si están visibles (sirven de respaldo
+           para completar el NIU con la base de usuarios). Limpia basura del nombre;
+           cédula solo números. Distingue 0/O y 1/I/l.
+        6. NO extraigas paneles, baterías, mediciones, coordenadas ni observaciones.
+
+        Estructura JSON requerida:
+        {
+            "NIU": "número o null",
+            "Fecha": "dd-mm-aaaa o null",
+            "Nombre_Usuario": "nombre completo limpio o null",
+            "Cedula_Usuario": "solo números o null"
+        }
+        """
+
+
+def extract_data_with_ai(file_path, filename, api_key=None, modelo=None, solo_renombre=False):
+    """Extrae los datos del acta usando un modelo de OpenRouter (por defecto Gemini).
+
+    Usa la API de OpenRouter (compatible con OpenAI), que no tiene una API de
+    archivos propia como la de Google, así que el documento se envía
+    codificado en base64 dentro del mensaje.
+
+    modelo: slug de OpenRouter elegido por el usuario (ver MODELOS_DISPONIBLES).
+    Si no se indica, o ya no existe (404), se usa MODELO_POR_DEFECTO / el
+    siguiente modelo disponible.
+
+    solo_renombre: si True, usa prompt corto y solo la 1ª página del PDF
+    (mucho más rápido; basta para NIU + Fecha).
+    """
+    modo = "renombre rápido" if solo_renombre else "OCR completo"
+    print(f"Procesando {filename} con OpenRouter ({modo})...")
+
+    ruta_subida = file_path
+    es_temporal = False
+    try:
+        api_key_segura = (api_key or "").strip() or _resolve_openrouter_api_key()
+        if not api_key_segura:
+            return {
+                "Archivo": filename,
+                "Error": (
+                    "No hay API key de OpenRouter. Configúrala en la aplicación "
+                    f"o crea un archivo .env en: {ruta_env}"
+                ),
+            }
+
+        cliente = _obtener_cliente(api_key_segura)
+
+        # Los PDFs muy pesados (registros fotográficos escaneados) conviene
+        # comprimirlos antes de codificarlos en base64.
+        # En renombre solo se envía la 1ª página (NIU/Fecha suelen estar ahí).
+        from src.utils.pdf_compressor import preparar_para_envio
+
+        ruta_subida, es_temporal = preparar_para_envio(
+            file_path, solo_primera_pagina=solo_renombre
+        )
+
+        parte_archivo = _codificar_archivo(ruta_subida)
+        prompt = _PROMPT_RENOMBRE if solo_renombre else _PROMPT_COMPLETO
 
         # Generar con el modelo elegido por el usuario; si ya no existe (404),
         # pasar al siguiente de la lista de respaldo.

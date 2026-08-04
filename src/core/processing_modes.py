@@ -12,7 +12,10 @@ MODE_OPTIONS = {
     },
     RENAME_ONLY: {
         "label": "Solo renombrar",
-        "description": "Lee el acta con IA y renombra el archivo a NIU_dd-mm-aaaa_acta. No genera Excel.",
+        "description": (
+            "Modo rápido: lee solo la portada (NIU + Fecha) y renombra a "
+            "NIU_dd-mm-aaaa_acta. No genera Excel."
+        ),
         "icon": "📝",
     },
     OCR_AND_RENAME: {
